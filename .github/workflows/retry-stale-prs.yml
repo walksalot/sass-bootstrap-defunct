@@ -1,0 +1,172 @@
+name: Retry Stale PRs
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+
+jobs:
+  retry-stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      STALE_MERGE_ENABLED: ${{ vars.STALE_MERGE_ENABLED }}
+      WORKFLOW_SAFETY_REQUIRED: ${{ vars.WORKFLOW_SAFETY_REQUIRED }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Process stale PRs safely
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const path = require('path');
+            const { pathToFileURL } = require('url');
+
+            const staleMergeEnabled = process.env.STALE_MERGE_ENABLED !== 'false';
+            if (!staleMergeEnabled) {
+              core.info('STALE_MERGE_ENABLED=false; stale merge worker is disabled.');
+              return;
+            }
+
+            const requireWorkflowSafety = process.env.WORKFLOW_SAFETY_REQUIRED !== 'false';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+            const now = Date.now();
+
+            const scriptPath = pathToFileURL(
+              path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-eligibility.mjs')
+            ).href;
+            const { evaluateMergeEligibility } = await import(scriptPath);
+
+            const safetyMessages = {
+              merge_conflict: '⚠️ Stale merge worker skipped this PR because it has merge conflicts with `main`.',
+              review_failed: '⚠️ Stale merge worker skipped this PR because the review check failed.',
+              workflow_safety_missing: '⚠️ Stale merge worker skipped this PR because `Workflow Safety` is required but missing.',
+              workflow_safety_failed: '⚠️ Stale merge worker skipped this PR because `Workflow Safety` failed.',
+              sha_mismatch: '⚠️ Stale merge worker skipped this PR because the branch changed during evaluation.'
+            };
+
+            async function postDedupComment(prNumber, marker, body) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: prNumber,
+                per_page: 100
+              });
+              const alreadyPosted = comments.some(comment => comment.body?.includes(marker));
+              if (alreadyPosted) {
+                return;
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+            }
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              base: 'main',
+              per_page: 100
+            });
+
+            if (prs.length === 0) {
+              core.info('No open PRs targeting main.');
+              return;
+            }
+
+            core.info(`Found ${prs.length} open PR(s) targeting main.`);
+
+            for (const prSummary of prs) {
+              const staleMs = now - Date.parse(prSummary.updated_at);
+              if (staleMs < SIX_HOURS_MS) {
+                const ageMinutes = Math.round(staleMs / 60000);
+                core.info(`PR #${prSummary.number}: updated ${ageMinutes}m ago, not stale enough.`);
+                continue;
+              }
+
+              const expectedHeadSha = prSummary.head.sha;
+              const decision = await evaluateMergeEligibility({
+                owner,
+                repo,
+                prNumber: prSummary.number,
+                expectedHeadSha,
+                requireWorkflowSafety,
+                token: process.env.GITHUB_TOKEN
+              });
+
+              core.info(`PR #${prSummary.number}: decision=${decision.reason}, details=${decision.details}`);
+
+              if (decision.reason === 'behind_main') {
+                try {
+                  await github.rest.pulls.updateBranch({ owner, repo, pull_number: prSummary.number });
+                } catch (error) {
+                  core.warning(`PR #${prSummary.number}: failed to update branch: ${error.message}`);
+                }
+
+                const marker = `<!-- stale-merge:behind_main:${expectedHeadSha} -->`;
+                await postDedupComment(
+                  prSummary.number,
+                  marker,
+                  `${marker}\n⏳ Stale merge worker paused: this PR is behind \`main\`, so I requested a branch update.`
+                );
+                continue;
+              }
+
+              if (decision.reason === 'safe_to_merge') {
+                const { data: latestPr } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: prSummary.number
+                });
+
+                if (latestPr.head.sha !== expectedHeadSha) {
+                  const marker = `<!-- stale-merge:sha_mismatch:${expectedHeadSha} -->`;
+                  await postDedupComment(
+                    prSummary.number,
+                    marker,
+                    `${marker}\n${safetyMessages.sha_mismatch}\n\nDetails: expected ${expectedHeadSha.slice(0, 7)}, now ${latestPr.head.sha.slice(0, 7)}.`
+                  );
+                  continue;
+                }
+
+                try {
+                  await github.rest.pulls.merge({
+                    owner,
+                    repo,
+                    pull_number: prSummary.number,
+                    merge_method: 'squash'
+                  });
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: prSummary.number,
+                    body: '✅ **Auto-merged by stale PR worker** — required checks passed and safety gates were satisfied.'
+                  });
+                } catch (error) {
+                  core.warning(`PR #${prSummary.number}: merge failed: ${error.message}`);
+                }
+                continue;
+              }
+
+              const safetyMessage = safetyMessages[decision.reason];
+              if (!safetyMessage) {
+                continue;
+              }
+
+              const marker = `<!-- stale-merge:${decision.reason}:${expectedHeadSha} -->`;
+              await postDedupComment(
+                prSummary.number,
+                marker,
+                `${marker}\n${safetyMessage}\n\nDetails: ${decision.details}`
+              );
+            }

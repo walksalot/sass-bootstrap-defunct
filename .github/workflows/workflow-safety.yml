@@ -1,0 +1,71 @@
+name: Workflow Safety
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  workflow-safety:
+    name: Workflow Safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Detect changed workflow files
+        id: changed
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100
+            });
+
+            const changedWorkflows = files
+              .map(file => file.filename)
+              .filter(filename => filename.startsWith('.github/workflows/'));
+
+            core.info(`Changed workflow files: ${changedWorkflows.join(', ') || '(none)'}`);
+            core.setOutput('count', String(changedWorkflows.length));
+            core.setOutput('files_json', JSON.stringify(changedWorkflows));
+
+      - name: Validate YAML syntax
+        if: steps.changed.outputs.count != '0'
+        env:
+          FILES_JSON: ${{ steps.changed.outputs.files_json }}
+        run: |
+          ruby -e 'require "json"; require "yaml"; files = JSON.parse(ENV.fetch("FILES_JSON")); files.each { |f| YAML.load_file(f) }; puts "Validated #{files.length} workflow file(s)."'
+
+      - name: Install actionlint
+        if: steps.changed.outputs.count != '0'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- 1.7.7
+
+      - name: Lint changed workflows
+        if: steps.changed.outputs.count != '0'
+        env:
+          FILES_JSON: ${{ steps.changed.outputs.files_json }}
+        run: |
+          node -e 'const files = JSON.parse(process.env.FILES_JSON); for (const file of files) console.log(file);' > /tmp/changed-workflows.txt
+          xargs -a /tmp/changed-workflows.txt ./actionlint
+
+      - name: Enforce workflow policy
+        if: steps.changed.outputs.count != '0'
+        env:
+          FILES_JSON: ${{ steps.changed.outputs.files_json }}
+        run: |
+          node .github/scripts/workflow-policy-check.mjs --files-json "$FILES_JSON"

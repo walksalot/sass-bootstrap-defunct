@@ -1,0 +1,155 @@
+name: Claude PR Auto-Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.user.login != 'copilot' &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Detect Review Workflow Changes
+        id: workflow_delta
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100
+            });
+
+            const changed = files.some(f => f.filename === '.github/workflows/claude-code-review.yml');
+            core.setOutput('review_workflow_changed', changed ? 'true' : 'false');
+            core.info(`Review workflow file changed in this PR: ${changed}`);
+
+      - name: Claude Code Review (Primary)
+        id: primary_review
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_bots: 'claude,claude[bot],app/claude,github-actions[bot]'
+          claude_args: |
+            --model claude-opus-4-6
+            --max-turns 45
+            --allowedTools "Read,Edit,Write,Glob,Grep,LS,Task,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment"
+          settings: |
+            {
+              "permissions": {
+                "allow": [
+                  "Read",
+                  "Edit",
+                  "Write",
+                  "Glob",
+                  "Grep",
+                  "LS",
+                  "Task"
+                ]
+              }
+            }
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: |
+            /code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+
+            Prioritize only high-impact findings (P0-P2): correctness, security, data integrity, and user-visible regressions.
+            Keep feedback concise and skip low-value style nits.
+          additional_permissions: |
+            actions: read
+          include_fix_links: 'true'
+          track_progress: 'true'
+
+      - name: Claude Code Review (Fallback)
+        id: fallback_review
+        if: steps.primary_review.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_bots: 'claude,claude[bot],app/claude,github-actions[bot]'
+          claude_args: |
+            --model claude-opus-4-6
+            --max-turns 24
+            --allowedTools "Read,Edit,Write,Glob,Grep,LS,Task,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment"
+          settings: |
+            {
+              "permissions": {
+                "allow": [
+                  "Read",
+                  "Edit",
+                  "Write",
+                  "Glob",
+                  "Grep",
+                  "LS",
+                  "Task"
+                ]
+              }
+            }
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: |
+            /code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+
+            Fallback mode: report only blocking issues (P0-P1). Skip nits and optional improvements.
+          additional_permissions: |
+            actions: read
+          include_fix_links: 'true'
+          track_progress: 'true'
+
+      - name: Finalize Review Status
+        if: always()
+        run: |
+          echo "Primary outcome: ${{ steps.primary_review.outcome }}"
+          echo "Fallback outcome: ${{ steps.fallback_review.outcome }}"
+          echo "Review workflow changed: ${{ steps.workflow_delta.outputs.review_workflow_changed }}"
+          {
+            echo "### Review Bot Result"
+            echo ""
+            echo "- Primary run: \`${{ steps.primary_review.outcome }}\`"
+            echo "- Fallback run: \`${{ steps.fallback_review.outcome }}\`"
+            echo "- Workflow self-change detected: \`${{ steps.workflow_delta.outputs.review_workflow_changed }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.primary_review.outcome }}" = "success" ] || [ "${{ steps.fallback_review.outcome }}" = "success" ]; then
+            echo "Review completed successfully."
+            echo "- Final decision: \`success\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ steps.workflow_delta.outputs.review_workflow_changed }}" = "true" ]; then
+            echo "Review skipped: PR modifies .github/workflows/claude-code-review.yml, which prevents Claude app-token validation in PR context."
+            echo "- Final decision: \`skipped (workflow self-change)\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "Both review attempts failed."
+          echo "- Final decision: \`failed\`" >> "$GITHUB_STEP_SUMMARY"
+          exit 1

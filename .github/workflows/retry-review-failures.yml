@@ -1,0 +1,131 @@
+name: Retry Failed Review Runs
+
+on:
+  workflow_run:
+    workflows: ["Claude PR Auto-Review"]
+    types: [completed]
+
+permissions:
+  actions: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  retry-failed-review:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REVIEW_RETRY_ENABLED: ${{ vars.REVIEW_RETRY_ENABLED }}
+    steps:
+      - name: Retry failed review run once per PR SHA
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const enabled = process.env.REVIEW_RETRY_ENABLED !== 'false';
+            if (!enabled) {
+              core.info('REVIEW_RETRY_ENABLED=false; skipping review retry worker.');
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const reviewRun = context.payload.workflow_run;
+            const prs = reviewRun.pull_requests || [];
+
+            if (prs.length === 0) {
+              core.info('No PR attached to failed review run.');
+              return;
+            }
+
+            const prNumber = prs[0].number;
+            const headSha = reviewRun.head_sha;
+            const marker = `<!-- review-retry:${headSha} -->`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100
+            });
+            if (comments.some(comment => comment.body?.includes(marker))) {
+              core.info(`Retry already attempted for PR #${prNumber} on ${headSha.slice(0, 7)}.`);
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber
+            });
+
+            if (pr.state !== 'open') {
+              core.info(`PR #${prNumber} is not open; skipping retry.`);
+              return;
+            }
+
+            if (pr.head.sha !== headSha) {
+              core.info(
+                `PR #${prNumber} moved from ${headSha.slice(0, 7)} to ${pr.head.sha.slice(0, 7)}; skipping stale retry.`
+              );
+              return;
+            }
+
+            const checkRunsResponse = await github.rest.checks.listForRef({
+              owner,
+              repo,
+              ref: headSha,
+              per_page: 100
+            });
+            const failingReview = (checkRunsResponse.data.check_runs || []).find(
+              checkRun => checkRun.name === 'review' && checkRun.conclusion === 'failure'
+            );
+
+            if (!failingReview) {
+              core.info(`No failing review check found for ${headSha.slice(0, 7)}.`);
+              return;
+            }
+
+            if (pr.mergeable_state === 'behind') {
+              try {
+                await github.rest.pulls.updateBranch({
+                  owner,
+                  repo,
+                  pull_number: prNumber
+                });
+
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  body: `${marker}\n🔁 Review retry worker updated this branch from \`main\` because it was behind. New checks should start automatically.`
+                });
+              } catch (error) {
+                core.warning(`Failed to update PR #${prNumber} branch before retry: ${error.message}`);
+              }
+              return;
+            }
+
+            try {
+              await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs', {
+                owner,
+                repo,
+                run_id: reviewRun.id
+              });
+            } catch (error) {
+              core.warning(`rerun-failed-jobs failed: ${error.message}. Falling back to full rerun.`);
+              await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun', {
+                owner,
+                repo,
+                run_id: reviewRun.id
+              });
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body: `${marker}\n🔁 Review retry worker re-ran the failed review workflow once for this commit SHA.`
+            });
+
+            core.info(`Triggered one retry for PR #${prNumber} on ${headSha.slice(0, 7)}.`);

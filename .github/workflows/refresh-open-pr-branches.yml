@@ -1,0 +1,98 @@
+name: Refresh Open PR Branches
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  refresh-open-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      WORKFLOW_BRANCH_REFRESH_ENABLED: ${{ vars.WORKFLOW_BRANCH_REFRESH_ENABLED }}
+    steps:
+      - name: Refresh open PR branches after workflow changes
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const enabled = process.env.WORKFLOW_BRANCH_REFRESH_ENABLED !== 'false';
+            if (!enabled) {
+              core.info('WORKFLOW_BRANCH_REFRESH_ENABLED=false; skipping workflow branch refresh worker.');
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const mainSha = context.sha || '';
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              base: 'main',
+              per_page: 100
+            });
+
+            let refreshed = 0;
+            let alreadyCurrent = 0;
+            let skippedForks = 0;
+            let failed = 0;
+
+            for (const pr of prs) {
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) {
+                skippedForks += 1;
+                continue;
+              }
+
+              try {
+                await github.rest.pulls.updateBranch({
+                  owner,
+                  repo,
+                  pull_number: pr.number
+                });
+                refreshed += 1;
+              } catch (error) {
+                const status = error.status || 0;
+                const message = String(error.message || '');
+                if (status === 422 && /not behind/i.test(message)) {
+                  alreadyCurrent += 1;
+                  continue;
+                }
+
+                failed += 1;
+                core.warning(`PR #${pr.number}: failed to refresh branch (${status}) ${message}`);
+
+                const marker = `<!-- workflow-refresh-failed:${mainSha}:${pr.head.sha} -->`;
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100
+                });
+                const exists = comments.some(comment => comment.body?.includes(marker));
+                if (!exists) {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    body: `${marker}\n⚠️ I could not auto-refresh this branch after workflow changes on \`main\`. Please resolve branch update conflicts and re-run checks.`
+                  });
+                }
+              }
+            }
+
+            await core.summary
+              .addHeading('Workflow Branch Refresh')
+              .addRaw(`Open PRs scanned: ${prs.length}\n`, true)
+              .addRaw(`Refreshed: ${refreshed}\n`, true)
+              .addRaw(`Already current: ${alreadyCurrent}\n`, true)
+              .addRaw(`Skipped forks: ${skippedForks}\n`, true)
+              .addRaw(`Failed updates: ${failed}\n`, true)
+              .write();

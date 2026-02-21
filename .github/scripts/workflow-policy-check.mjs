@@ -79,6 +79,7 @@ function checkPermissionsPolicy(fileName, content, violations) {
   const allowedWriteScopesByFile = {
     'claude-auto-fix.yml': new Set(['contents', 'pull-requests', 'issues', 'id-token', 'actions', 'checks']),
     'claude-assistant.yml': new Set(['contents', 'pull-requests', 'issues', 'id-token', 'actions']),
+    'codex-assistant.yml': new Set(['contents', 'pull-requests', 'issues', 'id-token', 'actions']),
     'retry-stale-prs.yml': new Set(['contents', 'pull-requests', 'issues', 'checks']),
     'claude-code-review.yml': new Set(['contents', 'pull-requests', 'issues', 'id-token', 'actions']),
     'retry-review-failures.yml': new Set(['actions', 'pull-requests', 'issues']),
@@ -109,23 +110,40 @@ function checkPermissionsPolicy(fileName, content, violations) {
 }
 
 function checkModelPolicy(fileName, content, violations) {
-  const allowedModels = new Set(['claude-opus-4-6', 'codex-5.3']);
+  const allowedModels = new Set(['claude-opus-4-6', 'gpt-5.3-codex']);
   const usesClaudeAction = /uses:\s*anthropics\/claude-code-action@/m.test(content);
-  const modelMatches = [...content.matchAll(/--model\s+([A-Za-z0-9._:-]+)/g)];
+  const usesCodexAction = /uses:\s*openai\/codex-action@/m.test(content);
+  const claudeModelMatches = [...content.matchAll(/--model\s+([A-Za-z0-9._:-]+)/g)];
+  const codexModelMatches = [...content.matchAll(/^\s*model:\s*['"]?([A-Za-z0-9._:-]+)['"]?\s*$/gm)];
+  const codexEffortMatches = [...content.matchAll(/^\s*effort:\s*['"]?([A-Za-z0-9._:-]+)['"]?\s*$/gm)];
 
-  if (usesClaudeAction && modelMatches.length === 0) {
+  if (usesClaudeAction && claudeModelMatches.length === 0) {
     violations.push(
       `${fileName} uses anthropics/claude-code-action but does not declare an explicit --model value.`
     );
-    return;
   }
 
-  for (const modelMatch of modelMatches) {
+  if (usesCodexAction && codexModelMatches.length === 0) {
+    violations.push(`${fileName} uses openai/codex-action but does not declare an explicit model value.`);
+  }
+
+  if (usesCodexAction && codexEffortMatches.length === 0) {
+    violations.push(`${fileName} uses openai/codex-action but does not declare an explicit effort value.`);
+  }
+
+  for (const modelMatch of [...claudeModelMatches, ...codexModelMatches]) {
     const model = modelMatch[1].toLowerCase();
     if (!allowedModels.has(model)) {
       violations.push(
-        `${fileName} uses disallowed model '${modelMatch[1]}'. Allowed models: claude-opus-4-6, codex-5.3.`
+        `${fileName} uses disallowed model '${modelMatch[1]}'. Allowed models: claude-opus-4-6, gpt-5.3-codex.`
       );
+    }
+  }
+
+  for (const effortMatch of codexEffortMatches) {
+    const effort = effortMatch[1].toLowerCase();
+    if (effort !== 'xhigh') {
+      violations.push(`${fileName} uses disallowed effort '${effortMatch[1]}'. Allowed effort: xhigh.`);
     }
   }
 }

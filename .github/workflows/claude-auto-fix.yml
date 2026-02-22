@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   auto-fix:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -38,11 +38,15 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const triggerWorkflow = context.payload.workflow_run.name;
+            const triggerConclusion = context.payload.workflow_run.conclusion || 'unknown';
             const autoFixEnabled = process.env.AUTO_FIX_ENABLED !== 'false';
             const autoMergeEnabled = process.env.AUTO_MERGE_ENABLED !== 'false';
             const workflowSafetyRequired = process.env.WORKFLOW_SAFETY_REQUIRED !== 'false';
             const prs = context.payload.workflow_run.pull_requests || [];
 
+            core.setOutput('trigger_workflow', triggerWorkflow);
+            core.setOutput('trigger_conclusion', triggerConclusion);
             core.setOutput('auto_fix_enabled', autoFixEnabled ? 'true' : 'false');
             core.setOutput('auto_merge_enabled', autoMergeEnabled ? 'true' : 'false');
             core.setOutput('workflow_safety_required', workflowSafetyRequired ? 'true' : 'false');
@@ -61,6 +65,7 @@ jobs:
             const labelNames = (pr.labels || []).map(label => label.name);
             const hasNoAutoFix = labelNames.includes('no-auto-fix');
             const hasNoAutoMerge = labelNames.includes('no-auto-merge');
+            const isReviewFailureEvent = triggerWorkflow === 'Claude PR Auto-Review' && triggerConclusion === 'failure';
 
             core.setOutput('has_pr', 'true');
             core.setOutput('pr_number', String(prNumber));
@@ -69,7 +74,15 @@ jobs:
             core.setOutput('pr_base_branch', pr.base.ref);
             core.setOutput('has_no_auto_fix', hasNoAutoFix ? 'true' : 'false');
             core.setOutput('has_no_auto_merge', hasNoAutoMerge ? 'true' : 'false');
-            core.setOutput('should_evaluate_merge', autoMergeEnabled ? 'true' : 'false');
+            core.setOutput('should_evaluate_merge', autoMergeEnabled && !hasNoAutoMerge ? 'true' : 'false');
+            core.setOutput('is_review_failure_event', isReviewFailureEvent ? 'true' : 'false');
+
+            if (!isReviewFailureEvent) {
+              core.info(`Workflow trigger is ${triggerWorkflow}/${triggerConclusion}; auto-fix run requires Claude PR Auto-Review failure.`);
+              core.setOutput('should_run', 'false');
+              core.setOutput('reason', 'not_review_failure_event');
+              return;
+            }
 
             const { data: comments } = await github.rest.pulls.listReviewComments({
               owner,
@@ -77,6 +90,12 @@ jobs:
               pull_number: prNumber,
               sort: 'created',
               direction: 'desc',
+              per_page: 100
+            });
+            const issueComments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
               per_page: 100
             });
             const { data: commits } = await github.rest.pulls.listCommits({
@@ -91,33 +110,42 @@ jobs:
               ? new Date(latestCommit.commit.committer.date)
               : new Date(0);
 
-            const freshBotComments = comments.filter(comment => {
-              if (comment.user?.type !== 'Bot') {
+            const allowedBotLogins = new Set(['claude', 'claude[bot]', 'app/claude', 'github-actions[bot]']);
+
+            const freshBotReviewComments = comments.filter(comment => {
+              if (comment.user?.type !== 'Bot' || !allowedBotLogins.has(comment.user?.login || '')) {
+                return false;
+              }
+              return new Date(comment.created_at) > latestCommitDate;
+            });
+            const freshNotApprovedVerdicts = issueComments.filter(comment => {
+              if (comment.user?.type !== 'Bot' || !allowedBotLogins.has(comment.user?.login || '')) {
+                return false;
+              }
+              if (!comment.body?.includes('VERDICT: NOT_APPROVED_FOR_MERGE')) {
                 return false;
               }
               return new Date(comment.created_at) > latestCommitDate;
             });
 
-            core.setOutput('comment_count', String(freshBotComments.length));
+            const totalFreshSignals = freshBotReviewComments.length + freshNotApprovedVerdicts.length;
+            core.setOutput('comment_count', String(totalFreshSignals));
 
-            if (freshBotComments.length === 0) {
-              core.info('No fresh bot review comments after the latest commit.');
+            if (totalFreshSignals === 0) {
+              core.info('No fresh actionable NOT_APPROVED review signals after the latest commit.');
               core.setOutput('should_run', 'false');
-              core.setOutput('reason', 'no_fresh_comments');
+              core.setOutput('reason', 'no_fresh_not_approved_signals');
               return;
             }
 
-            const commentSetIds = freshBotComments.map(comment => comment.id).sort((a, b) => a - b);
+            const commentSetIds = [
+              ...freshBotReviewComments.map(comment => `review:${comment.id}`),
+              ...freshNotApprovedVerdicts.map(comment => `issue:${comment.id}`)
+            ].sort();
             const commentSetKey = `${pr.head.sha}:${commentSetIds.join(',')}`;
             const marker = `<!-- auto-fix-cycle:${commentSetKey} -->`;
             core.setOutput('comment_set_key', commentSetKey);
 
-            const issueComments = await github.paginate(github.rest.issues.listComments, {
-              owner,
-              repo,
-              issue_number: prNumber,
-              per_page: 100
-            });
             const alreadyHandled = issueComments.some(comment => comment.body?.includes(marker));
             core.setOutput('already_handled', alreadyHandled ? 'true' : 'false');
 
@@ -142,9 +170,9 @@ jobs:
               return;
             }
 
-            core.info(`Will run auto-fix for ${freshBotComments.length} fresh bot comment(s).`);
+            core.info(`Will run auto-fix for ${totalFreshSignals} fresh NOT_APPROVED signal(s).`);
             core.setOutput('should_run', 'true');
-            core.setOutput('reason', 'fresh_comments_found');
+            core.setOutput('reason', 'fresh_not_approved_signals_found');
 
       - name: Mark auto-fix cycle
         if: steps.context.outputs.should_run == 'true'
@@ -200,19 +228,20 @@ jobs:
               }
             }
           prompt: |
-            You are auto-fixing review comments on PR #${{ steps.context.outputs.pr_number }}.
+            You are auto-fixing required changes for PR #${{ steps.context.outputs.pr_number }}.
 
             ## Steps
 
-            1. Read the review comments:
+            1. Read blocking review signals:
                ```
                gh api repos/${{ github.repository }}/pulls/${{ steps.context.outputs.pr_number }}/comments --jq '.[] | select(.user.type == "Bot") | {path, line, body}'
+               gh api repos/${{ github.repository }}/issues/${{ steps.context.outputs.pr_number }}/comments --jq '.[] | select((.user.type == "Bot") and (.body | contains("VERDICT: NOT_APPROVED_FOR_MERGE"))) | {created_at, body}'
                ```
 
-            2. For each actionable review comment:
+            2. For each REQUIRED_CHANGES item and blocking inline comment:
                - Read the file and understand the context
                - Implement the suggested fix
-               - Only fix what the reviewer asked for — do NOT refactor or improve unrelated code
+               - Only fix what is required for merge approval — do NOT refactor or improve unrelated code
 
             3. After all fixes:
                - Build: `npm run build -w gamecam-viewer`
@@ -232,7 +261,7 @@ jobs:
 
             ## Important
             - Read CLAUDE.md for project conventions
-            - Only fix issues raised in the review — nothing else
+            - Only fix issues required to move verdict from NOT_APPROVED_FOR_MERGE to APPROVED_FOR_MERGE
             - If a comment is subjective or unclear, skip it and mention it in your summary
             - Do NOT add features, refactor, or make improvements beyond what was requested
           additional_permissions: |
@@ -267,7 +296,7 @@ jobs:
         if: >-
           !cancelled() &&
           steps.context.outputs.has_pr == 'true' &&
-          steps.context.outputs.auto_merge_enabled == 'true' &&
+          steps.context.outputs.should_evaluate_merge == 'true' &&
           (steps.context.outputs.should_run != 'true' || steps.post_fix.outputs.sha_changed == 'false')
         env:
           GITHUB_TOKEN: ${{ github.token }}

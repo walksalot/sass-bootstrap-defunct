@@ -3,9 +3,6 @@ name: Claude PR Auto-Review
 on:
   pull_request:
     types: [opened, reopened, synchronize]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
 
 concurrency:
   group: pr-review-${{ github.event.pull_request.number }}
@@ -63,8 +60,17 @@ jobs:
             --allowedTools "Read,Edit,Write,Glob,Grep,LS,Task,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment"
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
-            Post concise comments only for high-impact findings (P0-P2): correctness, security, data integrity, and user-visible regressions.
-            Skip style-only or low-value nits.
+            At the top of your final review comment, include EXACTLY one verdict line:
+            - VERDICT: APPROVED_FOR_MERGE
+            - VERDICT: NOT_APPROVED_FOR_MERGE
+
+            If not approved, include:
+            1) Why it is not approved (plain English)
+            2) REQUIRED_CHANGES as a numbered checklist with concrete file/behavior fixes
+            3) Inline code comments for each blocking issue when a file/line is identifiable
+
+            Focus only on high-impact findings (P0-P2): correctness, security, data integrity, user-visible regressions.
+            Skip style-only and low-value nits.
           additional_permissions: |
             actions: read
           include_fix_links: 'true'
@@ -84,7 +90,12 @@ jobs:
             --allowedTools "Read,Edit,Write,Glob,Grep,LS,Task,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment"
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            At the top of your final review comment, include EXACTLY one verdict line:
+            - VERDICT: APPROVED_FOR_MERGE
+            - VERDICT: NOT_APPROVED_FOR_MERGE
+
             Fallback mode: report only blocking issues (P0-P1). Skip optional improvements and nits.
+            If not approved, include a REQUIRED_CHANGES numbered checklist with only must-fix items.
           additional_permissions: |
             actions: read
           include_fix_links: 'true'
@@ -106,16 +117,100 @@ jobs:
 
           if [ "${{ steps.primary_review.outcome }}" = "success" ] || [ "${{ steps.fallback_review.outcome }}" = "success" ]; then
             echo "Review completed successfully."
-            echo "- Final decision: \`success\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Final decision: \`APPROVED_FOR_MERGE\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           if [ "${{ steps.workflow_delta.outputs.review_workflow_changed }}" = "true" ]; then
             echo "Review skipped: PR modifies .github/workflows/claude-code-review.yml, which prevents Claude app-token validation in PR context."
-            echo "- Final decision: \`skipped (workflow self-change)\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Final decision: \`APPROVED_FOR_MERGE (workflow self-change exception)\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           echo "Both review attempts failed."
-          echo "- Final decision: \`failed\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Final decision: \`NOT_APPROVED_FOR_MERGE\`" >> "$GITHUB_STEP_SUMMARY"
           exit 1
+
+      - name: Publish Explicit Review Verdict
+        if: always()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request.number;
+            const headSha = context.payload.pull_request.head.sha;
+            const primaryOutcome = '${{ steps.primary_review.outcome }}';
+            const fallbackOutcome = '${{ steps.fallback_review.outcome }}';
+            const workflowChanged = '${{ steps.workflow_delta.outputs.review_workflow_changed }}' === 'true';
+
+            let verdict = 'NOT_APPROVED_FOR_MERGE';
+            let why = [];
+            let next = [];
+
+            if (primaryOutcome === 'success' || fallbackOutcome === 'success') {
+              verdict = 'APPROVED_FOR_MERGE';
+              why = [
+                'Claude review completed without blocking findings.'
+              ];
+              next = [
+                'No blocking review changes are required before merge.'
+              ];
+            } else if (workflowChanged) {
+              verdict = 'APPROVED_FOR_MERGE';
+              why = [
+                'This PR modifies the review workflow file, so review is skipped in this context to avoid self-review token restrictions.'
+              ];
+              next = [
+                'Workflow Safety remains required for workflow-file changes.'
+              ];
+            } else {
+              verdict = 'NOT_APPROVED_FOR_MERGE';
+              why = [
+                'Claude review did not pass this commit.'
+              ];
+              next = [
+                'Address all blocking Claude review findings and REQUIRED_CHANGES checklist items.',
+                'Push the fixes to this PR branch.',
+                'A new automatic review will run and re-evaluate merge approval.'
+              ];
+            }
+
+            const marker = `<!-- review-verdict:${headSha} -->`;
+            const body = [
+              marker,
+              '## Review Verdict',
+              '',
+              `VERDICT: ${verdict}`,
+              '',
+              'Why:',
+              ...why.map(item => `- ${item}`),
+              '',
+              'What to do next:',
+              ...next.map(item => `- ${item}`)
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100
+            });
+            const existing = comments.find(comment => comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body
+            });

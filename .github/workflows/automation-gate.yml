@@ -113,9 +113,9 @@ jobs:
             };
 
             const requiredChecks = parseRequiredChecks(process.env.REQUIRED_CHECKS_JSON);
-            const reviewGateMode = (process.env.REVIEW_GATE_MODE || 'advisory').trim().toLowerCase() === 'strict'
-              ? 'strict'
-              : 'advisory';
+            const reviewGateMode = (process.env.REVIEW_GATE_MODE || 'strict').trim().toLowerCase() === 'advisory'
+              ? 'advisory'
+              : 'strict';
             const workflowSafetyRequired = parseBool(process.env.WORKFLOW_SAFETY_REQUIRED, true);
 
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });

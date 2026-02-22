@@ -150,65 +150,36 @@ export function evaluateMergeEligibilitySnapshot({
   }
 
   if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
-    return decision('merge_conflict', 'PR currently has merge conflicts with main.', false);
+    return decision('merge_conflict', `PR currently has merge conflicts with ${pr.base?.ref || 'the base branch'}.`, false);
   }
 
   if (pr.mergeable_state === 'behind') {
-    return decision('behind_main', 'PR branch is behind main and needs update.', false);
+    return decision(
+      'behind_main',
+      `PR branch is behind ${pr.base?.ref || 'the base branch'} and needs update.`,
+      false
+    );
   }
 
   const requiresWorkflowSafety = Boolean(requireWorkflowSafety && workflowFilesChanged);
   const byName = latestRunsByName(checkRuns);
 
-  const qualityRun = byName.get('Quality');
+  const automationGateRun = byName.get('Automation Gate');
   const reviewRun = byName.get('review');
-  const coverageRuns = Array.from(byName.values()).filter(run => run.name.startsWith('Coverage Gate ('));
   const workflowSafetyRun = byName.get('Workflow Safety');
 
-  if (!qualityRun) {
-    return decision('pending_checks', 'Quality check has not started yet.', requiresWorkflowSafety);
-  }
-  if (!reviewRun) {
-    return decision('pending_checks', 'review check has not started yet.', requiresWorkflowSafety);
-  }
-  if (coverageRuns.length === 0) {
-    return decision('pending_checks', 'Coverage Gate checks have not started yet.', requiresWorkflowSafety);
-  }
-
-  const pendingRequiredChecks = [];
-  const failedRequiredChecks = [];
-  const requiredRuns = [qualityRun, ...coverageRuns, reviewRun];
-
-  for (const run of requiredRuns) {
-    if (run.status !== 'completed') {
-      pendingRequiredChecks.push(run.name);
-      continue;
-    }
-    if (!isSuccessfulConclusion(run.conclusion)) {
-      failedRequiredChecks.push(`${run.name} (${run.conclusion})`);
-    }
-  }
-
-  if (pendingRequiredChecks.length > 0) {
+  if (!automationGateRun) {
     return decision(
       'pending_checks',
-      `Required checks still running: ${pendingRequiredChecks.join(', ')}.`,
+      'Automation Gate check has not started yet.',
       requiresWorkflowSafety
     );
   }
 
-  if (reviewRun.status === 'completed' && !isSuccessfulConclusion(reviewRun.conclusion)) {
-    return decision(
-      'review_failed',
-      `review check failed with conclusion ${reviewRun.conclusion}.`,
-      requiresWorkflowSafety
-    );
-  }
-
-  if (failedRequiredChecks.length > 0) {
+  if (automationGateRun.status !== 'completed') {
     return decision(
       'pending_checks',
-      `Required checks failed: ${failedRequiredChecks.join(', ')}.`,
+      'Automation Gate check is still running.',
       requiresWorkflowSafety
     );
   }
@@ -237,9 +208,25 @@ export function evaluateMergeEligibilitySnapshot({
     }
   }
 
+  if (!isSuccessfulConclusion(automationGateRun.conclusion)) {
+    if (reviewRun && reviewRun.status === 'completed' && !isSuccessfulConclusion(reviewRun.conclusion)) {
+      return decision(
+        'review_failed',
+        `review check failed with conclusion ${reviewRun.conclusion}.`,
+        requiresWorkflowSafety
+      );
+    }
+
+    return decision(
+      'pending_checks',
+      `Automation Gate failed with conclusion ${automationGateRun.conclusion || 'none'}.`,
+      requiresWorkflowSafety
+    );
+  }
+
   return decision(
     'safe_to_merge',
-    `All required checks passed on ${shortSha(pr.head.sha)} (Quality=${runStatusSummary(qualityRun)}, Coverage=${coverageRuns.length} checks, review=${runStatusSummary(reviewRun)}).`,
+    `All required checks passed on ${shortSha(pr.head.sha)} (Automation Gate=${runStatusSummary(automationGateRun)}, review=${runStatusSummary(reviewRun)}).`,
     requiresWorkflowSafety
   );
 }

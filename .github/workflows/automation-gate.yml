@@ -1,0 +1,299 @@
+name: Automation Gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+  workflow_run:
+    workflows: ["CI", "Workflow Safety", "Claude PR Auto-Review"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  gate:
+    name: Automation Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REQUIRED_CHECKS_JSON: ${{ vars.REQUIRED_CHECKS_JSON }}
+      REVIEW_GATE_MODE: ${{ vars.REVIEW_GATE_MODE }}
+      WORKFLOW_SAFETY_REQUIRED: ${{ vars.WORKFLOW_SAFETY_REQUIRED }}
+    steps:
+      - name: Resolve PR context
+        id: context
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const eventName = context.eventName;
+
+            if (eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              core.setOutput('has_pr', 'true');
+              core.setOutput('owner', owner);
+              core.setOutput('repo', repo);
+              core.setOutput('pr_number', String(pr.number));
+              core.setOutput('head_sha', pr.head.sha);
+              core.info(`Resolved pull_request context for PR #${pr.number} @ ${pr.head.sha.slice(0, 7)}.`);
+              return;
+            }
+
+            if (eventName === 'workflow_run') {
+              const prs = context.payload.workflow_run.pull_requests || [];
+              if (prs.length === 0) {
+                core.setOutput('has_pr', 'false');
+                core.info('workflow_run event has no linked pull request.');
+                return;
+              }
+
+              const prNumber = prs[0].number;
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              core.setOutput('has_pr', 'true');
+              core.setOutput('owner', owner);
+              core.setOutput('repo', repo);
+              core.setOutput('pr_number', String(pr.number));
+              core.setOutput('head_sha', pr.head.sha);
+              core.info(`Resolved workflow_run context for PR #${pr.number} @ ${pr.head.sha.slice(0, 7)}.`);
+              return;
+            }
+
+            core.setOutput('has_pr', 'false');
+            core.info(`Unsupported event: ${eventName}`);
+
+      - name: Evaluate automation gate
+        id: gate
+        if: steps.context.outputs.has_pr == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = '${{ steps.context.outputs.owner }}';
+            const repo = '${{ steps.context.outputs.repo }}';
+            const prNumber = Number.parseInt('${{ steps.context.outputs.pr_number }}', 10);
+            const expectedHeadSha = '${{ steps.context.outputs.head_sha }}';
+
+            const parseBool = (value, fallback) => {
+              if (value === undefined || value === null || value === '') return fallback;
+              const v = String(value).trim().toLowerCase();
+              return ['1', 'true', 'yes', 'on'].includes(v);
+            };
+
+            const parseRequiredChecks = value => {
+              const fallback = ['CI'];
+              if (!value || !value.trim()) return fallback;
+              try {
+                const parsed = JSON.parse(value);
+                if (!Array.isArray(parsed)) return fallback;
+                return parsed.map(item => String(item).trim()).filter(Boolean);
+              } catch {
+                return fallback;
+              }
+            };
+
+            const isSuccessful = conclusion => conclusion === 'success' || conclusion === 'skipped';
+
+            const latestRunsByName = checkRuns => {
+              const byName = new Map();
+              for (const run of checkRuns) {
+                const previous = byName.get(run.name);
+                if (!previous) {
+                  byName.set(run.name, run);
+                  continue;
+                }
+                const previousTime = new Date(previous.started_at || previous.completed_at || 0).getTime();
+                const currentTime = new Date(run.started_at || run.completed_at || 0).getTime();
+                if (currentTime >= previousTime) {
+                  byName.set(run.name, run);
+                }
+              }
+              return byName;
+            };
+
+            const requiredChecks = parseRequiredChecks(process.env.REQUIRED_CHECKS_JSON);
+            const reviewGateMode = (process.env.REVIEW_GATE_MODE || 'advisory').trim().toLowerCase() === 'strict'
+              ? 'strict'
+              : 'advisory';
+            const workflowSafetyRequired = parseBool(process.env.WORKFLOW_SAFETY_REQUIRED, true);
+
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (pr.state !== 'open') {
+              core.setOutput('eligible', 'false');
+              core.setOutput('reason', 'pr_not_open');
+              core.setOutput('details', `PR #${prNumber} is not open.`);
+              return;
+            }
+
+            if (pr.head.sha !== expectedHeadSha) {
+              core.info(`PR head moved from ${expectedHeadSha.slice(0, 7)} to ${pr.head.sha.slice(0, 7)}. Evaluating current head.`);
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100
+            });
+            const workflowFilesChanged = files.some(file => file.filename.startsWith('.github/workflows/'));
+            const requiresWorkflowSafety = workflowSafetyRequired && workflowFilesChanged;
+
+            const summarizeCheckRun = run => (run ? `${run.status}/${run.conclusion || 'none'}` : 'missing');
+            const waitIntervalMs = 15000;
+            const maxAttempts = 40;
+
+            const evaluateCurrentHead = async () => {
+              const checkRunsResponse = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: pr.head.sha,
+                per_page: 100
+              });
+              const checkRuns = Array.isArray(checkRunsResponse.data?.check_runs)
+                ? checkRunsResponse.data.check_runs
+                : [];
+              const byName = latestRunsByName(checkRuns);
+
+              const pending = [];
+              const failed = [];
+
+              for (const checkName of requiredChecks) {
+                const run = byName.get(checkName);
+                if (!run) {
+                  pending.push(`${checkName} (missing)`);
+                  continue;
+                }
+                if (run.status !== 'completed') {
+                  pending.push(`${checkName} (running)`);
+                  continue;
+                }
+                if (!isSuccessful(run.conclusion)) {
+                  failed.push(`${checkName} (${run.conclusion || 'none'})`);
+                }
+              }
+
+              const reviewRun = byName.get('review');
+              if (reviewGateMode === 'strict') {
+                if (!reviewRun) {
+                  pending.push('review (missing)');
+                } else if (reviewRun.status !== 'completed') {
+                  pending.push('review (running)');
+                } else if (!isSuccessful(reviewRun.conclusion)) {
+                  failed.push(`review (${reviewRun.conclusion || 'none'})`);
+                }
+              }
+
+              const workflowSafetyRun = byName.get('Workflow Safety');
+              if (requiresWorkflowSafety) {
+                if (!workflowSafetyRun) {
+                  pending.push('Workflow Safety (missing)');
+                } else if (workflowSafetyRun.status !== 'completed') {
+                  pending.push('Workflow Safety (running)');
+                } else if (!isSuccessful(workflowSafetyRun.conclusion)) {
+                  failed.push(`Workflow Safety (${workflowSafetyRun.conclusion || 'none'})`);
+                }
+              }
+
+              return {
+                pending,
+                failed,
+                reviewRun,
+                workflowSafetyRun
+              };
+            };
+
+            let latestResult = null;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+              latestResult = await evaluateCurrentHead();
+              if (latestResult.failed.length > 0) {
+                break;
+              }
+              if (latestResult.pending.length === 0) {
+                break;
+              }
+              if (attempt === maxAttempts) {
+                break;
+              }
+
+              core.info(
+                `Attempt ${attempt}/${maxAttempts}: still waiting for checks (${latestResult.pending.join(', ')}).`
+              );
+              await new Promise(resolve => setTimeout(resolve, waitIntervalMs));
+            }
+
+            const { pending, failed, reviewRun, workflowSafetyRun } = latestResult;
+
+            if (failed.length > 0) {
+              core.setOutput('eligible', 'false');
+              core.setOutput('reason', 'required_checks_failed');
+              core.setOutput('details', `Blocking checks failed: ${failed.join(', ')}.`);
+              core.setOutput('required_checks', JSON.stringify(requiredChecks));
+              core.setOutput('review_gate_mode', reviewGateMode);
+              core.setOutput('requires_workflow_safety', requiresWorkflowSafety ? 'true' : 'false');
+              return;
+            }
+
+            if (pending.length > 0) {
+              core.setOutput('eligible', 'false');
+              core.setOutput('reason', 'pending_checks');
+              core.setOutput('details', `Timed out waiting for checks: ${pending.join(', ')}.`);
+              core.setOutput('required_checks', JSON.stringify(requiredChecks));
+              core.setOutput('review_gate_mode', reviewGateMode);
+              core.setOutput('requires_workflow_safety', requiresWorkflowSafety ? 'true' : 'false');
+              return;
+            }
+
+            const details = [
+              `Gate passed on ${pr.head.sha.slice(0, 7)}.`,
+              `Required checks: ${requiredChecks.join(', ')}.`,
+              `Review mode: ${reviewGateMode} (review: ${summarizeCheckRun(reviewRun)}).`,
+              `Workflow Safety required: ${requiresWorkflowSafety ? 'yes' : 'no'} (${summarizeCheckRun(workflowSafetyRun)}).`
+            ].join(' ');
+
+            core.setOutput('eligible', 'true');
+            core.setOutput('reason', 'safe_to_merge');
+            core.setOutput('details', details);
+            core.setOutput('required_checks', JSON.stringify(requiredChecks));
+            core.setOutput('review_gate_mode', reviewGateMode);
+            core.setOutput('requires_workflow_safety', requiresWorkflowSafety ? 'true' : 'false');
+
+      - name: Finalize gate result
+        if: always()
+        env:
+          GATE_PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          GATE_REQUIRED_CHECKS: ${{ steps.gate.outputs.required_checks }}
+          GATE_REVIEW_MODE: ${{ steps.gate.outputs.review_gate_mode }}
+          GATE_WORKFLOW_SAFETY: ${{ steps.gate.outputs.requires_workflow_safety }}
+          GATE_REASON: ${{ steps.gate.outputs.reason }}
+          GATE_DETAILS: ${{ steps.gate.outputs.details }}
+          GATE_ELIGIBLE: ${{ steps.gate.outputs.eligible }}
+        run: |
+          if [ "${{ steps.context.outputs.has_pr }}" != "true" ]; then
+            {
+              echo "### Automation Gate"
+              echo ""
+              echo "No pull request context found for this event. Nothing to evaluate."
+              echo ""
+              echo "- Decision: \`skipped\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Automation Gate"
+            echo ""
+            echo "- PR: \`#${GATE_PR_NUMBER}\`"
+            echo "- Required checks: \`${GATE_REQUIRED_CHECKS}\`"
+            echo "- Review gate mode: \`${GATE_REVIEW_MODE}\`"
+            echo "- Workflow Safety required: \`${GATE_WORKFLOW_SAFETY}\`"
+            echo "- Decision: \`${GATE_REASON}\`"
+            echo ""
+            printf '%s\n' "${GATE_DETAILS}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${GATE_ELIGIBLE}" = "true" ]; then
+            exit 0
+          fi
+
+          exit 1

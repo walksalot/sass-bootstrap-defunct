@@ -36,10 +36,17 @@ jobs:
             });
 
             const changedWorkflows = files
-              .map(file => file.filename)
-              .filter(filename => filename.startsWith('.github/workflows/'));
+              .filter(file => file.filename.startsWith('.github/workflows/'))
+              .filter(file => file.status !== 'removed')
+              .map(file => file.filename);
+
+            const removedWorkflows = files
+              .filter(file => file.filename.startsWith('.github/workflows/'))
+              .filter(file => file.status === 'removed')
+              .map(file => file.filename);
 
             core.info(`Changed workflow files: ${changedWorkflows.join(', ') || '(none)'}`);
+            core.info(`Removed workflow files: ${removedWorkflows.join(', ') || '(none)'}`);
             core.setOutput('count', String(changedWorkflows.length));
             core.setOutput('files_json', JSON.stringify(changedWorkflows));
 

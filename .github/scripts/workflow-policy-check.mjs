@@ -82,10 +82,11 @@ function checkPermissionsPolicy(fileName, content, violations) {
     'codex-assistant.yml': new Set(['contents', 'pull-requests', 'issues', 'id-token', 'actions']),
     'retry-stale-prs.yml': new Set(['contents', 'pull-requests', 'issues', 'checks']),
     'claude-code-review.yml': new Set(['contents', 'pull-requests', 'issues', 'id-token', 'actions']),
-    'retry-review-failures.yml': new Set(['actions', 'pull-requests', 'issues']),
-    'refresh-open-pr-branches.yml': new Set(['pull-requests', 'issues']),
+    'retry-review-failures.yml': new Set(['actions', 'checks', 'contents', 'pull-requests', 'issues']),
+    'refresh-open-pr-branches.yml': new Set(['contents', 'pull-requests', 'issues']),
     'branch-hygiene.yml': new Set(['contents']),
-    'automation-canary.yml': new Set(['contents', 'pull-requests', 'issues'])
+    'automation-canary.yml': new Set(['contents', 'pull-requests', 'issues']),
+    'automation-gate.yml': new Set([])
   };
 
   const entries = collectPermissionEntries(content);
@@ -173,6 +174,38 @@ function checkMergeBypassPolicy(fileName, content, violations) {
   }
 }
 
+function checkMergeEligibilityReferencePolicy(fileName, content, violations) {
+  const mergeCapableWorkflows = new Set(['claude-auto-fix.yml', 'retry-stale-prs.yml']);
+  if (!mergeCapableWorkflows.has(fileName)) {
+    return;
+  }
+
+  if (!content.includes('merge-eligibility.mjs')) {
+    violations.push(
+      `${fileName} is merge-capable but does not reference .github/scripts/merge-eligibility.mjs.`
+    );
+  }
+}
+
+function checkReviewWorkflowPolicy(fileName, content, violations) {
+  if (fileName !== 'claude-code-review.yml') {
+    return;
+  }
+
+  if (/^\s*plugin_marketplaces:\s*/m.test(content)) {
+    violations.push(`${fileName} reintroduces plugin_marketplaces, which is not allowed by policy.`);
+  }
+  if (/^\s*plugins:\s*/m.test(content)) {
+    violations.push(`${fileName} reintroduces plugins, which is not allowed by policy.`);
+  }
+  if (/^\s*settings:\s*/m.test(content)) {
+    violations.push(`${fileName} reintroduces settings input, which is blocked by policy.`);
+  }
+  if (/\/code-review\b/.test(content)) {
+    violations.push(`${fileName} reintroduces slash-command review prompts, which are not allowed by policy.`);
+  }
+}
+
 function run() {
   const args = parseArgs(process.argv.slice(2));
   const files = parseFiles(args);
@@ -197,6 +230,8 @@ function run() {
     checkModelPolicy(fileName, content, violations);
     checkToolPolicy(fileName, content, violations);
     checkMergeBypassPolicy(fileName, content, violations);
+    checkMergeEligibilityReferencePolicy(fileName, content, violations);
+    checkReviewWorkflowPolicy(fileName, content, violations);
   }
 
   if (violations.length > 0) {

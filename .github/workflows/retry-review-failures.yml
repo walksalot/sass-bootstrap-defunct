@@ -7,6 +7,8 @@ on:
 
 permissions:
   actions: write
+  checks: read
+  contents: write
   pull-requests: write
   issues: write
 
@@ -42,6 +44,24 @@ jobs:
             const headSha = reviewRun.head_sha;
             const marker = `<!-- review-retry:${headSha} -->`;
 
+            async function postDedupComment(commentMarker, body) {
+              const existingComments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: prNumber,
+                per_page: 100
+              });
+              if (existingComments.some(comment => comment.body?.includes(commentMarker))) {
+                return;
+              }
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body
+              });
+            }
+
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
@@ -71,12 +91,29 @@ jobs:
               return;
             }
 
-            const checkRunsResponse = await github.rest.checks.listForRef({
-              owner,
-              repo,
-              ref: headSha,
-              per_page: 100
-            });
+            let checkRunsResponse;
+            try {
+              checkRunsResponse = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: headSha,
+                per_page: 100
+              });
+            } catch (error) {
+              const status = error.status || 0;
+              const permissionMarker = `<!-- review-retry-permission:${headSha} -->`;
+              const isPermissionError = status === 403 || status === 401;
+              if (isPermissionError) {
+                await postDedupComment(
+                  permissionMarker,
+                  `${permissionMarker}\n⚠️ Review retry worker could not read check-runs due to permissions (${status}). Exiting safely; no retry loop was triggered.`
+                );
+                core.warning(`Permission denied reading check-runs: ${error.message}`);
+                return;
+              }
+
+              throw error;
+            }
             const failingReview = (checkRunsResponse.data.check_runs || []).find(
               checkRun => checkRun.name === 'review' && checkRun.conclusion === 'failure'
             );
@@ -98,9 +135,19 @@ jobs:
                   owner,
                   repo,
                   issue_number: prNumber,
-                  body: `${marker}\n🔁 Review retry worker updated this branch from \`main\` because it was behind. New checks should start automatically.`
+                  body: `${marker}\n🔁 Review retry worker updated this branch from \`${pr.base.ref}\` because it was behind. New checks should start automatically.`
                 });
               } catch (error) {
+                const status = error.status || 0;
+                if (status === 403 || status === 401) {
+                  const permissionMarker = `<!-- review-retry-permission-update:${headSha} -->`;
+                  await postDedupComment(
+                    permissionMarker,
+                    `${permissionMarker}\n⚠️ Review retry worker could not update this branch due to permissions (${status}). Exiting safely.`
+                  );
+                  core.warning(`Permission denied updating PR #${prNumber} branch before retry: ${error.message}`);
+                  return;
+                }
                 core.warning(`Failed to update PR #${prNumber} branch before retry: ${error.message}`);
               }
               return;
@@ -114,18 +161,30 @@ jobs:
               });
             } catch (error) {
               core.warning(`rerun-failed-jobs failed: ${error.message}. Falling back to full rerun.`);
-              await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun', {
-                owner,
-                repo,
-                run_id: reviewRun.id
-              });
+              try {
+                await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun', {
+                  owner,
+                  repo,
+                  run_id: reviewRun.id
+                });
+              } catch (fallbackError) {
+                const status = fallbackError.status || 0;
+                if (status === 403 || status === 401) {
+                  const permissionMarker = `<!-- review-retry-permission-rerun:${headSha} -->`;
+                  await postDedupComment(
+                    permissionMarker,
+                    `${permissionMarker}\n⚠️ Review retry worker could not re-run workflow due to permissions (${status}). Exiting safely.`
+                  );
+                  core.warning(`Permission denied re-running failed review workflow: ${fallbackError.message}`);
+                  return;
+                }
+                throw fallbackError;
+              }
             }
 
-            await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: prNumber,
-              body: `${marker}\n🔁 Review retry worker re-ran the failed review workflow once for this commit SHA.`
-            });
+            await postDedupComment(
+              marker,
+              `${marker}\n🔁 Review retry worker re-ran the failed review workflow once for this commit SHA.`
+            );
 
             core.info(`Triggered one retry for PR #${prNumber} on ${headSha.slice(0, 7)}.`);

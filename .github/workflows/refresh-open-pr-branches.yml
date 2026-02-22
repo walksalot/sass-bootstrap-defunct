@@ -2,12 +2,13 @@ name: Refresh Open PR Branches
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     paths:
       - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
+  contents: write
   pull-requests: write
   issues: write
 
@@ -30,13 +31,22 @@ jobs:
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const mainSha = context.sha || '';
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.default_branch || 'main';
+            const pushedRef = context.ref || '';
+            const expectedRef = `refs/heads/${defaultBranch}`;
+            const defaultBranchSha = context.sha || '';
+
+            if (context.eventName === 'push' && pushedRef !== expectedRef) {
+              core.info(`Push was on ${pushedRef}; default branch is ${expectedRef}. Skipping refresh.`);
+              return;
+            }
 
             const prs = await github.paginate(github.rest.pulls.list, {
               owner,
               repo,
               state: 'open',
-              base: 'main',
+              base: defaultBranch,
               per_page: 100
             });
 
@@ -69,7 +79,7 @@ jobs:
                 failed += 1;
                 core.warning(`PR #${pr.number}: failed to refresh branch (${status}) ${message}`);
 
-                const marker = `<!-- workflow-refresh-failed:${mainSha}:${pr.head.sha} -->`;
+                const marker = `<!-- workflow-refresh-failed:${defaultBranchSha}:${pr.head.sha} -->`;
                 const comments = await github.paginate(github.rest.issues.listComments, {
                   owner,
                   repo,
@@ -82,7 +92,7 @@ jobs:
                     owner,
                     repo,
                     issue_number: pr.number,
-                    body: `${marker}\n⚠️ I could not auto-refresh this branch after workflow changes on \`main\`. Please resolve branch update conflicts and re-run checks.`
+                    body: `${marker}\n⚠️ I could not auto-refresh this branch after workflow changes on \`${defaultBranch}\`. Please resolve branch update conflicts and re-run checks.`
                   });
                 }
               }
@@ -90,6 +100,7 @@ jobs:
 
             await core.summary
               .addHeading('Workflow Branch Refresh')
+              .addRaw(`Base branch: ${defaultBranch}\n`, true)
               .addRaw(`Open PRs scanned: ${prs.length}\n`, true)
               .addRaw(`Refreshed: ${refreshed}\n`, true)
               .addRaw(`Already current: ${alreadyCurrent}\n`, true)

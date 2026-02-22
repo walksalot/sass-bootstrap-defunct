@@ -61,27 +61,10 @@ jobs:
             --model claude-opus-4-6
             --max-turns 45
             --allowedTools "Read,Edit,Write,Glob,Grep,LS,Task,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment"
-          settings: |
-            {
-              "permissions": {
-                "allow": [
-                  "Read",
-                  "Edit",
-                  "Write",
-                  "Glob",
-                  "Grep",
-                  "LS",
-                  "Task"
-                ]
-              }
-            }
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
           prompt: |
-            /code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
-
-            Prioritize only high-impact findings (P0-P2): correctness, security, data integrity, and user-visible regressions.
-            Keep feedback concise and skip low-value style nits.
+            Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            Post concise comments only for high-impact findings (P0-P2): correctness, security, data integrity, and user-visible regressions.
+            Skip style-only or low-value nits.
           additional_permissions: |
             actions: read
           include_fix_links: 'true'
@@ -99,25 +82,9 @@ jobs:
             --model claude-opus-4-6
             --max-turns 24
             --allowedTools "Read,Edit,Write,Glob,Grep,LS,Task,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment"
-          settings: |
-            {
-              "permissions": {
-                "allow": [
-                  "Read",
-                  "Edit",
-                  "Write",
-                  "Glob",
-                  "Grep",
-                  "LS",
-                  "Task"
-                ]
-              }
-            }
-          plugins: 'code-review@claude-code-plugins'
           prompt: |
-            /code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
-
-            Fallback mode: report only blocking issues (P0-P1). Skip nits and optional improvements.
+            Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            Fallback mode: report only blocking issues (P0-P1). Skip optional improvements and nits.
           additional_permissions: |
             actions: read
           include_fix_links: 'true'

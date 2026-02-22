@@ -2,7 +2,7 @@ name: Claude Auto-Fix & Auto-Merge
 
 on:
   workflow_run:
-    workflows: ["Claude PR Auto-Review", "CI"]
+    workflows: ["Claude PR Auto-Review", "CI", "Automation Gate"]
     types: [completed]
 
 permissions:
@@ -66,6 +66,7 @@ jobs:
             core.setOutput('pr_number', String(prNumber));
             core.setOutput('pr_branch', pr.head.ref);
             core.setOutput('pr_head_sha', pr.head.sha);
+            core.setOutput('pr_base_branch', pr.base.ref);
             core.setOutput('has_no_auto_fix', hasNoAutoFix ? 'true' : 'false');
             core.setOutput('has_no_auto_merge', hasNoAutoMerge ? 'true' : 'false');
             core.setOutput('should_evaluate_merge', autoMergeEnabled ? 'true' : 'false');
@@ -302,8 +303,9 @@ jobs:
             const repo = context.repo.repo;
             const prNumber = Number.parseInt('${{ steps.context.outputs.pr_number }}', 10);
             const headSha = '${{ steps.context.outputs.pr_head_sha }}';
+            const baseBranch = '${{ steps.context.outputs.pr_base_branch }}';
             const marker = `<!-- auto-merge-reason:behind_main:${headSha} -->`;
-            const body = `${marker}\n⏳ Auto-merge paused: this PR is behind \`main\`. I requested a branch update and will re-check on the next run.`;
+            const body = `${marker}\n⏳ Auto-merge paused: this PR is behind \`${baseBranch}\`. I requested a branch update and will re-check on the next run.`;
 
             try {
               await github.rest.pulls.updateBranch({ owner, repo, pull_number: prNumber });
@@ -338,7 +340,7 @@ jobs:
             const details = ${{ toJSON(steps.eligibility.outputs.details) }};
 
             const reasonMessages = {
-              merge_conflict: '⚠️ Auto-merge blocked because this PR has merge conflicts with `main`.',
+              merge_conflict: '⚠️ Auto-merge blocked because this PR has merge conflicts with its base branch.',
               review_failed: '⚠️ Auto-merge blocked because the review check failed.',
               workflow_safety_missing: '⚠️ Auto-merge blocked because `Workflow Safety` is required but missing for workflow-file changes.',
               workflow_safety_failed: '⚠️ Auto-merge blocked because `Workflow Safety` failed.',

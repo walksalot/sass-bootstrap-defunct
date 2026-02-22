@@ -50,7 +50,7 @@ jobs:
             const { evaluateMergeEligibility } = await import(scriptPath);
 
             const safetyMessages = {
-              merge_conflict: '⚠️ Stale merge worker skipped this PR because it has merge conflicts with `main`.',
+              merge_conflict: '⚠️ Stale merge worker skipped this PR because it has merge conflicts with the default branch.',
               review_failed: '⚠️ Stale merge worker skipped this PR because the review check failed.',
               workflow_safety_missing: '⚠️ Stale merge worker skipped this PR because `Workflow Safety` is required but missing.',
               workflow_safety_failed: '⚠️ Stale merge worker skipped this PR because `Workflow Safety` failed.',
@@ -71,20 +71,23 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
             }
 
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.default_branch || 'main';
+
             const prs = await github.paginate(github.rest.pulls.list, {
               owner,
               repo,
               state: 'open',
-              base: 'main',
+              base: defaultBranch,
               per_page: 100
             });
 
             if (prs.length === 0) {
-              core.info('No open PRs targeting main.');
+              core.info(`No open PRs targeting ${defaultBranch}.`);
               return;
             }
 
-            core.info(`Found ${prs.length} open PR(s) targeting main.`);
+            core.info(`Found ${prs.length} open PR(s) targeting ${defaultBranch}.`);
 
             for (const prSummary of prs) {
               const staleMs = now - Date.parse(prSummary.updated_at);
@@ -117,7 +120,7 @@ jobs:
                 await postDedupComment(
                   prSummary.number,
                   marker,
-                  `${marker}\n⏳ Stale merge worker paused: this PR is behind \`main\`, so I requested a branch update.`
+                  `${marker}\n⏳ Stale merge worker paused: this PR is behind \`${defaultBranch}\`, so I requested a branch update.`
                 );
                 continue;
               }

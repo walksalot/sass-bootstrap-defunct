@@ -114,13 +114,24 @@ function checkModelPolicy(fileName, content, violations) {
   const allowedModels = new Set(['claude-opus-4-6', 'gpt-5.3-codex']);
   const usesClaudeAction = /uses:\s*anthropics\/claude-code-action@/m.test(content);
   const usesCodexAction = /uses:\s*openai\/codex-action@/m.test(content);
-  const claudeModelMatches = [...content.matchAll(/--model\s+([A-Za-z0-9._:-]+)/g)];
-  const codexModelMatches = [...content.matchAll(/^\s*model:\s*['"]?([A-Za-z0-9._:-]+)['"]?\s*$/gm)];
+  const claudeModelFlagMatches = [...content.matchAll(/--model\s+([A-Za-z0-9._:-]+)/g)];
+  const nativeModelMatches = [...content.matchAll(/^\s*model:\s*['"]?([A-Za-z0-9._:-]+)['"]?\s*$/gm)];
   const codexEffortMatches = [...content.matchAll(/^\s*effort:\s*['"]?([A-Za-z0-9._:-]+)['"]?\s*$/gm)];
+
+  // Claude action model must be pinned via --model in claude_args.
+  const claudeModelMatches = [...claudeModelFlagMatches];
+  // Codex action accepts model via native model: input only
+  const codexModelMatches = nativeModelMatches;
 
   if (usesClaudeAction && claudeModelMatches.length === 0) {
     violations.push(
-      `${fileName} uses anthropics/claude-code-action but does not declare an explicit --model value.`
+      `${fileName} uses anthropics/claude-code-action but does not declare an explicit model value via --model in claude_args.`
+    );
+  }
+
+  if (usesClaudeAction && nativeModelMatches.length > 0) {
+    violations.push(
+      `${fileName} uses unsupported 'model:' input for anthropics/claude-code-action; use --model in claude_args instead.`
     );
   }
 

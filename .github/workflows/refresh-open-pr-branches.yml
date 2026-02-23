@@ -22,6 +22,7 @@ jobs:
       - name: Refresh open PR branches after workflow changes
         uses: actions/github-script@v8
         with:
+          github-token: ${{ github.token }}
           script: |
             const enabled = process.env.WORKFLOW_BRANCH_REFRESH_ENABLED !== 'false';
             if (!enabled) {

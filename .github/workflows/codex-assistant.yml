@@ -45,18 +45,9 @@ jobs:
       - name: Codex Assistant
         uses: openai/codex-action@v1
         with:
-          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          trigger-phrase: "@codex"
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           model: gpt-5.3-codex
           effort: xhigh
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          use-compact-model: false
-          config: |
-            model_reasoning_effort = "xhigh"
-            [tools]
-            web_search = true
-            [tools.bash]
-            enabled = true
           prompt: |
             You are an autonomous assistant for this repository.
 

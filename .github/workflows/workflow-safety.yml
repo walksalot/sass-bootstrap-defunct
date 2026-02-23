@@ -60,7 +60,25 @@ jobs:
       - name: Install actionlint
         if: steps.changed.outputs.count != '0'
         run: |
-          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- 1.7.7
+          set -euo pipefail
+          version="1.7.7"
+          url="https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          for attempt in 1 2 3 4 5; do
+            echo "Downloading actionlint (attempt ${attempt})"
+            rm -f /tmp/actionlint.tar.gz
+            if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors -o /tmp/actionlint.tar.gz "${url}"; then
+              if tar -tzf /tmp/actionlint.tar.gz >/dev/null 2>&1; then
+                tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+                install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+                actionlint -version
+                exit 0
+              fi
+              echo "Downloaded file was not a valid tar.gz; retrying..."
+            fi
+            sleep 2
+          done
+          echo "Failed to install actionlint after multiple attempts." >&2
+          exit 1
 
       - name: Lint changed workflows
         if: steps.changed.outputs.count != '0'
@@ -68,7 +86,7 @@ jobs:
           FILES_JSON: ${{ steps.changed.outputs.files_json }}
         run: |
           node -e 'const files = JSON.parse(process.env.FILES_JSON); for (const file of files) console.log(file);' > /tmp/changed-workflows.txt
-          xargs -a /tmp/changed-workflows.txt ./actionlint
+          xargs -a /tmp/changed-workflows.txt actionlint
 
       - name: Enforce workflow policy
         if: steps.changed.outputs.count != '0'

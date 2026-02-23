@@ -28,6 +28,7 @@ jobs:
       - name: Process stale PRs safely
         uses: actions/github-script@v8
         with:
+          github-token: ${{ github.token }}
           script: |
             const path = require('path');
             const { pathToFileURL } = require('url');

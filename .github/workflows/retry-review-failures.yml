@@ -5,30 +5,34 @@ on:
     workflows: ["Claude PR Auto-Review"]
     types: [completed]
 
-permissions:
-  actions: write
-  checks: read
-  contents: write
-  pull-requests: write
-  issues: write
-
 jobs:
   retry-failed-review:
     if: github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: write
+      checks: read
+      contents: write
+      pull-requests: write
+      issues: write
     env:
       REVIEW_RETRY_ENABLED: ${{ vars.REVIEW_RETRY_ENABLED }}
+      REVIEW_RETRY_MAX: ${{ vars.REVIEW_RETRY_MAX }}
     steps:
-      - name: Retry failed review run once per PR SHA
+      - name: Retry failed review run with bounded attempts per PR SHA
         uses: actions/github-script@v8
         with:
+          github-token: ${{ github.token }}
           script: |
             const enabled = process.env.REVIEW_RETRY_ENABLED !== 'false';
             if (!enabled) {
               core.info('REVIEW_RETRY_ENABLED=false; skipping review retry worker.');
               return;
             }
+
+            const parsedRetryMax = Number.parseInt(process.env.REVIEW_RETRY_MAX || '3', 10);
+            const retryMax = Number.isFinite(parsedRetryMax) && parsedRetryMax > 0 ? parsedRetryMax : 3;
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -42,7 +46,9 @@ jobs:
 
             const prNumber = prs[0].number;
             const headSha = reviewRun.head_sha;
-            const marker = `<!-- review-retry:${headSha} -->`;
+            const legacyMarker = `<!-- review-retry:${headSha} -->`;
+            const markerPrefix = `<!-- review-retry:${headSha}:attempt:`;
+            const exhaustedMarker = `<!-- review-retry-exhausted:${headSha} -->`;
 
             async function postDedupComment(commentMarker, body) {
               const existingComments = await github.paginate(github.rest.issues.listComments, {
@@ -68,10 +74,20 @@ jobs:
               issue_number: prNumber,
               per_page: 100
             });
-            if (comments.some(comment => comment.body?.includes(marker))) {
-              core.info(`Retry already attempted for PR #${prNumber} on ${headSha.slice(0, 7)}.`);
+
+            const attemptsFromNewMarkers = comments.filter(comment => comment.body?.includes(markerPrefix)).length;
+            const attemptsFromLegacyMarkers = comments.some(comment => comment.body?.includes(legacyMarker)) ? 1 : 0;
+            const attemptsSoFar = attemptsFromNewMarkers + attemptsFromLegacyMarkers;
+            if (attemptsSoFar >= retryMax) {
+              await postDedupComment(
+                exhaustedMarker,
+                `${exhaustedMarker}\n⚠️ Review retry worker reached max attempts (${retryMax}) for \`${headSha.slice(0, 7)}\`. No further automatic reruns will be triggered for this commit SHA.`
+              );
+              core.info(`Retry limit reached for PR #${prNumber} on ${headSha.slice(0, 7)} (${attemptsSoFar}/${retryMax}).`);
               return;
             }
+            const nextAttempt = attemptsSoFar + 1;
+            const attemptMarker = `${markerPrefix}${nextAttempt} -->`;
 
             const { data: pr } = await github.rest.pulls.get({
               owner,
@@ -123,6 +139,37 @@ jobs:
               return;
             }
 
+            const reviewVerdictMarker = `<!-- review-verdict:${headSha} -->`;
+            const verdictComment = comments
+              .filter(comment => comment.body?.includes(reviewVerdictMarker))
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+            if (verdictComment) {
+              const body = verdictComment.body || '';
+              const approved = /VERDICT:\s*APPROVED_FOR_MERGE/i.test(body);
+              const actionable = /ACTIONABLE:\s*true/i.test(body);
+              const nonActionable = /ACTIONABLE:\s*false/i.test(body);
+
+              if (approved) {
+                core.info(`Latest verdict is APPROVED_FOR_MERGE for ${headSha.slice(0, 7)}; no retry needed.`);
+                return;
+              }
+
+              if (actionable) {
+                const actionableMarker = `<!-- review-retry-skipped-actionable:${headSha} -->`;
+                await postDedupComment(
+                  actionableMarker,
+                  `${actionableMarker}\nℹ️ Review retry worker skipped rerun for \`${headSha.slice(0, 7)}\` because Claude returned \`ACTIONABLE: true\` (required code changes).`
+                );
+                core.info(`Latest verdict is actionable for ${headSha.slice(0, 7)}; skipping retry.`);
+                return;
+              }
+
+              if (nonActionable) {
+                core.info(`Latest verdict is non-actionable for ${headSha.slice(0, 7)}; retry is allowed.`);
+              }
+            }
+
             if (pr.mergeable_state === 'behind') {
               try {
                 await github.rest.pulls.updateBranch({
@@ -135,7 +182,7 @@ jobs:
                   owner,
                   repo,
                   issue_number: prNumber,
-                  body: `${marker}\n🔁 Review retry worker updated this branch from \`${pr.base.ref}\` because it was behind. New checks should start automatically.`
+                  body: `${attemptMarker}\n🔁 Review retry worker updated this branch from \`${pr.base.ref}\` because it was behind. New checks should start automatically. (attempt ${nextAttempt}/${retryMax})`
                 });
               } catch (error) {
                 const status = error.status || 0;
@@ -183,8 +230,8 @@ jobs:
             }
 
             await postDedupComment(
-              marker,
-              `${marker}\n🔁 Review retry worker re-ran the failed review workflow once for this commit SHA.`
+              attemptMarker,
+              `${attemptMarker}\n🔁 Review retry worker re-ran the failed review workflow (attempt ${nextAttempt}/${retryMax}) for this commit SHA.`
             );
 
-            core.info(`Triggered one retry for PR #${prNumber} on ${headSha.slice(0, 7)}.`);
+            core.info(`Triggered retry attempt ${nextAttempt}/${retryMax} for PR #${prNumber} on ${headSha.slice(0, 7)}.`);

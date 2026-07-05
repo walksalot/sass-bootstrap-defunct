@@ -111,7 +111,7 @@ function checkPermissionsPolicy(fileName, content, violations) {
 }
 
 function checkModelPolicy(fileName, content, violations) {
-  const allowedModels = new Set(['claude-opus-4-6', 'gpt-5.3-codex']);
+  const allowedModels = new Set(['claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-6', 'gpt-5.3-codex']);
   const usesClaudeAction = /uses:\s*anthropics\/claude-code-action@/m.test(content);
   const usesCodexAction = /uses:\s*openai\/codex-action@/m.test(content);
   const claudeModelFlagMatches = [...content.matchAll(/--model\s+([A-Za-z0-9._:-]+)/g)];
@@ -147,7 +147,7 @@ function checkModelPolicy(fileName, content, violations) {
     const model = modelMatch[1].toLowerCase();
     if (!allowedModels.has(model)) {
       violations.push(
-        `${fileName} uses disallowed model '${modelMatch[1]}'. Allowed models: claude-opus-4-6, gpt-5.3-codex.`
+        `${fileName} uses disallowed model '${modelMatch[1]}'. Allowed models: claude-fable-5, claude-opus-4-8, claude-opus-4-6, gpt-5.3-codex.`
       );
     }
   }

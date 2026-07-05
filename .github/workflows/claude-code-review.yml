@@ -52,7 +52,7 @@ jobs:
       - name: Claude Code Review (Primary)
         id: primary_review
         if: steps.workflow_delta.outputs.review_workflow_changed != 'true'
-        timeout-minutes: 15
+        timeout-minutes: 25
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
@@ -62,8 +62,10 @@ jobs:
           use_sticky_comment: false
           track_progress: 'false'
           claude_args: |
-            --model claude-opus-4-6
-            --max-turns 28
+            --model claude-fable-5
+            --fallback-model claude-opus-4-8
+            --max-turns 60
+            --allowedTools "Write,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),mcp__github_inline_comment__create_inline_comment"
             --disallowedTools WebFetch,WebSearch
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
@@ -79,11 +81,14 @@ jobs:
             Focus only on high-impact findings (P0-P2): correctness, security, data integrity, user-visible regressions.
             Skip style-only and low-value nits.
             Use only repository-local context (PR diff/files and git/github tools). Do not browse external web pages.
+            IMPORTANT: you MUST publish the review. Write the full review to review-comment.md in the
+            workspace, then post it with: gh pr comment ${{ github.event.pull_request.number }} --body-file review-comment.md
+            The run is a failure if no PR comment containing the VERDICT line is posted.
 
       - name: Claude Code Review (Fallback)
         id: fallback_review
         if: steps.workflow_delta.outputs.review_workflow_changed != 'true' && steps.primary_review.outcome == 'failure'
-        timeout-minutes: 4
+        timeout-minutes: 10
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
@@ -93,8 +98,10 @@ jobs:
           use_sticky_comment: false
           track_progress: 'false'
           claude_args: |
-            --model claude-opus-4-6
-            --max-turns 8
+            --model claude-fable-5
+            --fallback-model claude-opus-4-8
+            --max-turns 20
+            --allowedTools "Write,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),mcp__github_inline_comment__create_inline_comment"
             --disallowedTools WebFetch,WebSearch
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
@@ -105,6 +112,9 @@ jobs:
             Fallback mode: report only blocking issues (P0-P1). Skip optional improvements and nits.
             If not approved, include a REQUIRED_CHANGES numbered checklist with only must-fix items.
             Use only repository-local context (PR diff/files and git/github tools). Do not browse external web pages.
+            IMPORTANT: you MUST publish the review. Write the full review to review-comment.md in the
+            workspace, then post it with: gh pr comment ${{ github.event.pull_request.number }} --body-file review-comment.md
+            The run is a failure if no PR comment containing the VERDICT line is posted.
 
       - name: Resolve Review Verdict
         id: verdict
@@ -120,7 +130,9 @@ jobs:
             const workflowOnly = '${{ steps.workflow_delta.outputs.workflow_only }}' === 'true';
             const primaryOutcome = '${{ steps.primary_review.outcome }}';
             const fallbackOutcome = '${{ steps.fallback_review.outcome }}';
-            const allowedReviewAuthors = new Set(['claude', 'claude[bot]', 'app/claude']);
+            const allowedReviewAuthors = new Set(['claude', 'claude[bot]', 'app/claude', 'github-actions[bot]']);
+            // Pipeline bots share the github-actions[bot] author; never read their marker comments as review verdicts.
+            const pipelineMarker = /<!--\s*(review-verdict|review-retry|auto-merge-reason|auto-fix)/;
 
             const { data: commits } = await github.rest.pulls.listCommits({
               owner,
@@ -143,12 +155,14 @@ jobs:
             const verdictRegex = /VERDICT:\s*(APPROVED_FOR_MERGE|NOT_APPROVED_FOR_MERGE)/i;
             const recentClaudeComments = issueComments
               .filter(comment => allowedReviewAuthors.has(comment.user?.login || ''))
+              .filter(comment => !pipelineMarker.test(comment.body || ''))
               .filter(comment => new Date(comment.created_at) > latestCommitDate)
               .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
             const verdictComment =
               recentClaudeComments.find(comment => verdictRegex.test(comment.body || '')) ||
               issueComments
                 .filter(comment => allowedReviewAuthors.has(comment.user?.login || ''))
+                .filter(comment => !pipelineMarker.test(comment.body || ''))
                 .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
                 .find(comment => verdictRegex.test(comment.body || ''));
 
